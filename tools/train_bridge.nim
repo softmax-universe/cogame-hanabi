@@ -199,7 +199,8 @@ when isMainModule:
       var parsed: Decision
       let seat = game.turn mod Seats
       try:
-        action = parseJson(request["response"].getStr())
+        action = if languageMode: extractJsonObject(request["response"].getStr())
+          else: parseJson(request["response"].getStr())
         parsed = parseDecision(game, action)
         let reason = game.illegalReason(parsed.move)
         if reason.len > 0:

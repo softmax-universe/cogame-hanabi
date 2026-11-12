@@ -31,7 +31,8 @@ try:
             assert rejected['kind'] == 'rejected' and rejected['reason']
             assert rejected['observation'] == observation
             assert request({'kind': 'teacher'})['response'] == teacher
-        result = request({'kind': 'step', 'decision_id': observation['decision_id'], 'response': teacher})
+        formatted = f'```json\n{teacher}\n```' if decisions % 2 == 0 else teacher
+        result = request({'kind': 'step', 'decision_id': observation['decision_id'], 'response': formatted})
         assert result['kind'] == 'accepted'
         observation = result['observation']
         decisions += 1
