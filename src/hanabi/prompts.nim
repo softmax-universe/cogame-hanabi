@@ -17,7 +17,7 @@ type
     seed*: int
 
 const
-  PromptBankVersion* = "hanabi-rules-v3"
+  PromptBankVersion* = "hanabi-rules-v4"
 
 proc promptSelection*(node: JsonNode): PromptSelection =
   if node.kind != JObject:
