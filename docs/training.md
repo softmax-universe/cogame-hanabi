@@ -38,7 +38,7 @@ five wordings independently within training and validation. Episode IDs include
 requested selection, resolved wording, and prompt seed to distinguish matched collections. The existing private complete-episode format retains
 selected teacher decisions and the exact source revision. Every fifth seed goes
 to validation; mode and wording replicas share seed families. Existing output
-directories are rejected. The `hanabi-rules-v3` bank uses independent explanations of complete mechanics
+directories are rejected. The `hanabi-rules-v4` bank uses independent explanations of complete mechanics
 and varies section order without introducing partner conventions. Canonical text and
 reply syntax stay exact.
 

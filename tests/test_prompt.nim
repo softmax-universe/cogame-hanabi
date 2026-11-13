@@ -115,6 +115,16 @@ suite "the seat's observation":
     check cardName(sim.deck[0]) notin
       text.split("MOVE LOG")[0].split("PARTNERS' HANDS")[0]
 
+  test "userPrompt closes with crisp LEGAL MOVES copy and target-order guidance":
+    let sim = crafted()
+    let prompt = sim.userPrompt(0, "my operator prompt")
+    check "Copy ONE exact JSON move from LEGAL MOVES" in prompt
+    check "\"target\" before \"hintType\"/\"hintValue\"" in prompt
+    check "\"note\" (<=400 chars)" in prompt
+    check "\"banner\" (<=80 chars)" in prompt
+    for identity in OwnIdentities:
+      check identity notin prompt
+
 suite "the legal-move list is the legality rule":
   test "every printed entry parses back into a legal move, and vice versa":
     var sim = crafted()

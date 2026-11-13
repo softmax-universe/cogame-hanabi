@@ -403,10 +403,10 @@ proc operatorBlock*(prompt: string): string =
 
 proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result = sim.seatObservation(seat, operatorBlock(prompt))
-  result.add("\n\nReply with ONLY one JSON object copied from LEGAL MOVES, " &
-    "optionally with \"note\" (at most " & $MaxNoteLen &
-    " characters, private to you) and \"banner\" (at most " & $MaxBannerLen &
-    " characters, spectators only).")
+  result.add("\n\nCopy ONE exact JSON move from LEGAL MOVES (keep \"target\" " &
+    "before \"hintType\"/\"hintValue\" so hints match a card held by that " &
+    "target); optionally add \"note\" (<=" & $MaxNoteLen &
+    " chars) and \"banner\" (<=" & $MaxBannerLen & " chars).")
 
 # ---- Reply parsing ----------------------------------------------------------
 
