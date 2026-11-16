@@ -693,7 +693,12 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
         "mid-JSON: " & head)
 
 proc spaceRequests(client: LlmClient) =
-  ## Hold consecutive request STARTS MinRequestSpacingSeconds apart.
+  ## Hold consecutive request STARTS MinRequestSpacingSeconds apart on shared
+  ## remote endpoints; loopback sidecars need no artificial throttle delay.
+  if client.transport == ltSidecar and (
+      client.sidecarEndpoint.startsWith("http://127.0.0.1") or
+      client.sidecarEndpoint.startsWith("http://localhost")):
+    return
   let wait = client.lastRequestAt + MinRequestSpacingSeconds - epochTime()
   if wait > 0.0:
     sleep(int(wait * 1000))
@@ -803,8 +808,10 @@ proc decideAll*(
           raise newException(HanabiError, reason)
         decision.origin = if attempt == 0: "llm" else: "retry"
         evidence.parsedAction = moveJson(decision.move)
-        evidence.parsedAction["note"] = %decision.note
-        evidence.parsedAction["banner"] = %decision.banner
+        if decision.note.len > 0:
+          evidence.parsedAction["note"] = %decision.note
+        if decision.banner.len > 0:
+          evidence.parsedAction["banner"] = %decision.banner
         evidence.accepted = true
         result[index].nativeAttempts.add(evidence)
         decision.nativeAttempts = result[index].nativeAttempts

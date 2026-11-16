@@ -5,8 +5,10 @@ import llm, sim, prompts
 
 proc decisionAction*(decision: Decision): JsonNode =
   result = moveJson(decision.move)
-  result["note"] = %decision.note
-  result["banner"] = %decision.banner
+  if decision.note.len > 0:
+    result["note"] = %decision.note
+  if decision.banner.len > 0:
+    result["banner"] = %decision.banner
 
 proc recordAppliedDecision*(trajectory: DecisionTrajectory, before: Sim,
     seat: int, proposed, applied: Decision, operatorPrompt: string,
