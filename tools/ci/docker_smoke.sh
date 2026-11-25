@@ -164,7 +164,10 @@ extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "
 
 for slot in range(seats):
     player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
-    entry = by_id.get(player_id) or {}
+    if not any(kv.startswith("COWORLD_LLM_ENDPOINT=") for kv in extra_env) and by_id[player_id].get("env", {}).get("COWORLD_LLM_ENABLED") == "true":
+        # This offline test runs the explicit scripted opponent in each model seat.
+        player_id = "hanabi-conventions"
+    entry = by_id[player_id]
     env_args = []
     for key, value in (entry.get("env") or {}).items():
         env_args += ["-e", f"{key}={value}"]
