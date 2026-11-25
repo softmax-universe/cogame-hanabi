@@ -15,11 +15,9 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Explicit scripted seats run their deterministic baseline without an LLM.
+## Non-scripted seats without credentials or with failed/rejected inference
+## return a failure decision rather than substituting a scripted move.
 
 import
   std/[json, options, os, strutils, times, unicode],
@@ -32,18 +30,23 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
+  DefaultBedrockModel* = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
   ## The hosted Bedrock sidecar caps 30 requests a minute per episode and a
   ## throttle cascades, so consecutive requests START at least this far
   ## apart. A turn is one request (two with a retry), so this bounds the
   ## episode at 30/minute by construction whatever the latency.
   MinRequestSpacingSeconds* = 2.0
-  ## Caps on the fields a reply may carry, in RUNES.
-  MaxActionLen* = 12
-  MaxTargetLen* = 24
-  MaxHintFieldLen* = 8
+  ## Caps on rejected-reply diagnostics, in RUNES.
   MaxRejectLen* = 200
 
 type
+  LlmInfraError* = object of HanabiError
+
+  FailureKind* = enum
+    fkNone
+    fkModel
+    fkInfra
+
   ScriptKind* = enum
     skNone = "none"
     skConventions = "conventions"
@@ -53,9 +56,10 @@ type
     move*: Move
     note*: string       ## private to the seat, fed back next turn
     banner*: string     ## spectator-only, never read by any seat
-    origin*: string     ## llm | retry | fallback | scripted
+    origin*: string     ## llm | retry | external | scripted | rejected | missing
     policy*: string     ## actual scripted teacher identity
-    reject*: string     ## why the model's reply was refused, if it was
+    reject*: string     ## why the model's reply was refused or unavailable
+    failureKind*: FailureKind
     nativeAttempts*: seq[DecisionAttempt]
 
   LlmTransport = enum
@@ -67,11 +71,9 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModel*: string   ## single configured Bedrock model (no fallback rotation)
     bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    model: string         ## active model id
     maxOutputTokens: int
     timeoutSeconds: int
     lastRequestAt: float  ## start of the most recent batch, for the floor
@@ -99,39 +101,16 @@ proc resolveApiKey(): string =
     echo "hanabi llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another. The config "model" field is NOT consulted
-  ## here: it applies to the direct-Anthropic transport only, and the
-  ## haiku-first ordering below is a shared-capacity decision that trumps
-  ## per-game preference.
+proc bedrockModelId*(): string =
+  ## Single Bedrock inference-profile id. BEDROCK_MODEL pins a custom id;
+  ## otherwise use DefaultBedrockModel with no implicit model fallback rotation.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first. `claude-sonnet-4-6` is
-  ## deliberately absent: it times out on every hosted sidecar call and
-  ## turns one throttle into a fallback cascade (cogame-raid, 2026-08-23).
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
+    return pinned
+  DefaultBedrockModel
 
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "hanabi llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+proc bedrockUrl*(client: LlmClient): string =
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -159,11 +138,12 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = bedrockModelId()
+    result.model = result.bedrockModel
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "hanabi llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
+      result.bedrockModel,
       ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
@@ -174,7 +154,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "hanabi llm: no LLM credentials; using scripted fallback"
+    echo "hanabi llm: no LLM credentials; non-scripted seats will fail unscored"
 
 # ---- Scripted baselines -----------------------------------------------------
 #
@@ -427,186 +407,106 @@ proc cleanText*(text: string, limit: int): string =
   result = result.runeSubStr(0, limit - 1) & "…"
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the FIRST balanced {...} object out of a model reply, tolerating
-  ## a UTF-8 BOM, markdown fences and trailing prose. parseJson alone raises
-  ## "EOF expected" on a valid object followed by a sentence, which would
-  ## burn the single retry on a reply that was already good enough.
+  ## Parses a single JSON object, either bare or inside one ordinary outer
+  ## Markdown code fence (plain or json-tagged). Surrounding prose, extra
+  ## objects, or non-object JSON values are rejected.
   var body = text.strip()
   if body.len >= 3 and body[0 .. 2] == "\xEF\xBB\xBF":
     body = body[3 .. ^1].strip()
   if body.startsWith("```"):
     let firstBreak = body.find('\n')
-    if firstBreak >= 0:
-      body = body[firstBreak + 1 .. ^1]
-    let fence = body.rfind("```")
-    if fence >= 0:
-      body = body[0 ..< fence]
-    body = body.strip()
-  let start = body.find('{')
-  if start < 0:
-    let head = headRunes(body, 160)
-    raise newException(HanabiError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  var depth = 0
-  var inString = false
-  var escaped = false
-  var stop = -1
-  for index in start ..< body.len:
-    let ch = body[index]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{': depth += 1
-    of '}':
-      depth -= 1
-      if depth == 0:
-        stop = index
-    else: discard
-    if stop >= 0:
-      break
-  if stop < 0:
-    raise newException(HanabiError, "unbalanced JSON object in response")
-  parseJson(body[start .. stop])
-
-proc intFrom(node: JsonNode): int =
-  ## An integer, a numeric string, or a rounded float; -1 when it is none of
-  ## those (every caller range-checks anyway).
-  if node.isNil:
-    return -1
-  case node.kind
-  of JInt: node.getInt()
-  of JFloat: int(node.getFloat())
-  of JString:
-    let text = node.getStr().strip()
-    try: parseInt(text) except ValueError: -1
-  else: -1
-
-proc seatFrom(sim: Sim, node: JsonNode): int =
-  ## A seat index, or a table alias (case-insensitive).
-  if node.isNil:
-    return -1
-  if node.kind == JString:
-    let text = cleanText(node.getStr(), MaxTargetLen).toLowerAscii()
-    for seat, name in sim.names:
-      if name.toLowerAscii() == text:
-        return seat
-    return intFrom(node)
-  intFrom(node)
-
-proc hintKindFrom(text: string): int =
-  ## 0 = colour, 1 = rank, -1 = neither.
-  case cleanText(text, MaxHintFieldLen).toLowerAscii()
-  of "colour", "color", "suit": 0
-  of "rank", "number", "value": 1
-  else: -1
-
-proc colourFrom(text: string): int =
-  let want = cleanText(text, MaxHintFieldLen).toLowerAscii()
-  let full = colourIndex(want)
-  if full >= 0:
-    return full
-  if want.len == 1:
-    for index, letter in ColourLetters:
-      if letter.toLowerAscii() == want:
-        return index
-  -1
-
-proc hintFromValue(target: int, raw: string, kind: int): Move =
-  ## `kind` is 0 colour, 1 rank, -1 "infer from the shape of the value".
-  let text = cleanText(raw, MaxHintFieldLen).strip()
-  var wantRank = kind == 1
-  if kind < 0:
-    wantRank = text.len > 0 and text[0] in {'0' .. '9'}
-  if wantRank:
-    var rank = -1
-    try: rank = parseInt(text) except ValueError: rank = -1
-    if rank < 1 or rank > 5:
-      raise newException(HanabiError, "a rank hint is 1..5, not \"" & text & "\"")
-    return Move(kind: akHint, target: target, hintKind: hkRank, value: rank)
-  let colour = colourFrom(text)
-  if colour < 0:
+    if firstBreak < 0:
+      raise newException(HanabiError, "unclosed markdown code fence")
+    let tag = body[3 ..< firstBreak].strip().toLowerAscii()
+    if tag notin ["", "json"]:
+      raise newException(HanabiError,
+        "markdown code fence must be plain or json-tagged")
+    var inner = body[firstBreak + 1 .. ^1]
+    if not inner.endsWith("```"):
+      raise newException(HanabiError, "unclosed markdown code fence")
+    inner = inner[0 ..< inner.len - 3]
+    let lastNl = inner.rfind('\n')
+    if lastNl < 0 or inner[lastNl + 1 .. ^1].strip().len > 0:
+      raise newException(HanabiError,
+        "closing markdown code fence must be on its own line")
+    body = inner.strip()
+  if body.len == 0:
+    raise newException(HanabiError, "empty response")
+  try:
+    result = parseJson(body)
+  except JsonParsingError as error:
     raise newException(HanabiError,
-      "\"" & text & "\" is not one of red, yellow, green, blue, white")
-  Move(kind: akHint, target: target, hintKind: hkColour, value: colour)
-
-proc parseShortMove(sim: Sim, text: string): Move =
-  ## {"move": "play 2"} / {"move": "discard 4"} / {"move": "hint 2 red"}.
-  let parts = text.strip().toLowerAscii().split({' ', ',', ':'})
-  var words: seq[string]
-  for part in parts:
-    if part.len > 0:
-      words.add(part)
-  if words.len == 0:
-    raise newException(HanabiError, "empty move")
-  case cleanText(words[0], MaxActionLen)
-  of "play", "discard":
-    if words.len < 2:
-      raise newException(HanabiError, words[0] & " needs a slot")
-    var slot = -1
-    try: slot = parseInt(words[1]) except ValueError: slot = -1
-    Move(kind: (if words[0] == "play": akPlay else: akDiscard), slot: slot,
-      target: -1)
-  of "hint", "tell", "clue":
-    if words.len < 3:
-      raise newException(HanabiError, "a hint needs a target and a value")
-    let target = seatFrom(sim, %words[1])
-    hintFromValue(target, words[2], -1)
-  else:
-    raise newException(HanabiError,
-      "\"" & cleanText(words[0], MaxActionLen) &
-      "\" is not play, discard or hint")
+      "response must be a single JSON object: " & error.msg)
+  if result.kind != JObject:
+    raise newException(HanabiError, "response must be a single JSON object")
 
 proc parseDecision*(sim: Sim, payload: JsonNode): Decision =
-  ## Normalises a reply into the canonical move, or raises HanabiError with
-  ## a reason specific enough to put in the retry prompt. Legality is NOT
-  ## checked here — `legalMoves` is the one rule and the caller applies it.
-  result.note = cleanText(payload{"note"}.getStr(), MaxNoteLen)
-  result.banner = cleanText(payload{"banner"}.getStr(), MaxBannerLen)
-    .replace("\n", " ").replace("\r", " ")
-  let short = payload{"move"}
-  if not short.isNil and short.kind == JString:
-    result.move = parseShortMove(sim, short.getStr())
-    return
-  let actionNode = payload{"action"}
-  if actionNode.isNil or actionNode.kind != JString:
+  ## Parses a canonical move JSON object matching LEGAL MOVES, plus optional
+  ## string "note" and "banner" fields, or raises HanabiError. Legality is
+  ## checked by the caller via `illegalReason`.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(HanabiError, "reply must be a JSON object")
+  if payload.hasKey("note") and payload["note"].kind != JNull:
+    if payload["note"].kind != JString:
+      raise newException(HanabiError, "\"note\" must be a string")
+    result.note = cleanText(payload["note"].getStr(), MaxNoteLen)
+  if payload.hasKey("banner") and payload["banner"].kind != JNull:
+    if payload["banner"].kind != JString:
+      raise newException(HanabiError, "\"banner\" must be a string")
+    result.banner = cleanText(payload["banner"].getStr(), MaxBannerLen)
+      .replace("\n", " ").replace("\r", " ")
+  if not payload.hasKey("action") or payload["action"].kind != JString:
     raise newException(HanabiError,
       "no \"action\" in the reply: it must be play, discard or hint")
-  let action = cleanText(actionNode.getStr(), MaxActionLen).toLowerAscii()
+  let action = payload["action"].getStr()
   case action
   of "play", "discard":
-    let slot = intFrom(payload{"slot"})
-    result.move = Move(kind: (if action == "play": akPlay else: akDiscard),
-      slot: slot, target: -1)
-  of "hint", "tell", "clue":
-    let target = seatFrom(sim, payload{"target"})
-    if target < 0 or target >= Seats:
-      raise newException(HanabiError,
-        "\"target\" must be a seat number or a table name")
-    var kind = -1
-    let typeNode = payload{"hintType"}
-    if not typeNode.isNil and typeNode.kind == JString:
-      kind = hintKindFrom(typeNode.getStr())
-      if kind < 0:
+    for key in payload.keys:
+      if key notin ["action", "slot", "note", "banner"]:
         raise newException(HanabiError,
-          "\"hintType\" must be \"colour\" or \"rank\"")
-    var value = payload{"hintValue"}
-    if value.isNil:
-      value = payload{"hint"}
-    if value.isNil:
+          "unexpected field \"" & key & "\" for " & action)
+    if not payload.hasKey("slot") or payload["slot"].kind != JInt:
+      raise newException(HanabiError, "\"slot\" must be an integer")
+    result.move = Move(
+      kind: (if action == "play": akPlay else: akDiscard),
+      slot: payload["slot"].getInt(),
+      target: -1
+    )
+  of "hint":
+    for key in payload.keys:
+      if key notin ["action", "target", "hintType", "hintValue", "note", "banner"]:
+        raise newException(HanabiError,
+          "unexpected field \"" & key & "\" for hint")
+    if not payload.hasKey("target") or payload["target"].kind != JInt:
+      raise newException(HanabiError, "\"target\" must be an integer seat index")
+    let target = payload["target"].getInt()
+    if not payload.hasKey("hintType") or payload["hintType"].kind != JString:
       raise newException(HanabiError,
-        "a hint needs \"hintValue\": a colour name or a rank 1..5")
-    let raw =
-      if value.kind == JString: value.getStr()
-      elif value.kind == JInt: $value.getInt()
-      else: $value
-    result.move = hintFromValue(target, raw, kind)
+        "\"hintType\" must be \"colour\" or \"rank\"")
+    let hintType = payload["hintType"].getStr()
+    if not payload.hasKey("hintValue") or payload["hintValue"].kind != JString:
+      raise newException(HanabiError,
+        "a hint needs string \"hintValue\": a colour name or rank \"1\"..\"5\"")
+    let hintValue = payload["hintValue"].getStr()
+    case hintType
+    of "colour":
+      let colour = ColourNames.find(hintValue)
+      if colour < 0:
+        raise newException(HanabiError,
+          "\"" & hintValue & "\" is not one of red, yellow, green, blue, white")
+      result.move = Move(kind: akHint, target: target, hintKind: hkColour,
+        value: colour)
+    of "rank":
+      const Ranks = ["1", "2", "3", "4", "5"]
+      let rankIndex = Ranks.find(hintValue)
+      if rankIndex < 0:
+        raise newException(HanabiError,
+          "a rank hint is \"1\"..\"5\", not \"" & hintValue & "\"")
+      result.move = Move(kind: akHint, target: target, hintKind: hkRank,
+        value: rankIndex + 1)
+    else:
+      raise newException(HanabiError,
+        "\"hintType\" must be \"colour\" or \"rank\"")
   else:
     raise newException(HanabiError,
       "\"" & action & "\" is not play, discard or hint")
@@ -649,32 +549,34 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
-proc textOf(client: LlmClient, response: Response, error, url: string):
+proc textOf*(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a HanabiError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next turn.
+  ## The text of one batched reply, or an error describing why there is none.
+  ## Transport, auth, throttle, and non-2xx provider errors raise LlmInfraError
+  ## without rotating to an alternate model.
   if error.len > 0:
-    raise newException(HanabiError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = headRunes(response.body, 400)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(HanabiError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(HanabiError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = headRunes(response.body, 300)
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(HanabiError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(HanabiError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "llm provider error " & $response.code &
       ": " & headRunes(response.body, 300))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raise newException(LlmInfraError,
+      "llm provider returned invalid JSON: " & parseErr.msg)
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(HanabiError, "anthropic refusal")
+  if not payload.hasKey("content") or payload["content"].kind != JArray:
+    raise newException(LlmInfraError, "llm provider response missing content")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
@@ -713,21 +615,24 @@ proc decideAll*(
   selection: PromptSelection
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — for Hanabi that list is
-  ## always the single seat whose turn it is, so this is one request, at
-  ## most one retry, then the scripted fallback. Never raises: any failure
-  ## falls back to the `conventions` baseline so the episode always
-  ## advances. `prompts` and `scripted` are indexed by SEAT.
+  ## always the single seat whose turn it is, so this is one request and at
+  ## most one retry on a rejected model reply. Genuine scripted seats run
+  ## their baseline; non-scripted failures return failureKind=fkInfra
+  ## (origin="missing") or failureKind=fkModel (origin="rejected") without
+  ## substituting a scripted move.
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   var rejects = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skConventions else: kind))
-      if kind == skNone:
-        result[index].origin = "fallback"
-        result[index].reject = "Inference credentials unavailable"
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind)
+    elif client.disabled:
+      result[index] = Decision(
+        origin: "missing",
+        failureKind: fkInfra,
+        reject: "Inference credentials unavailable"
+      )
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -763,6 +668,8 @@ proc decideAll*(
       var evidence = pendingEvidence[position]
       evidence.latencyMs = some((epochTime() - started) * 1000)
       let nativeResponse = responses[position].response
+      if nativeResponse.code >= 100 and nativeResponse.code <= 599:
+        evidence.httpStatus = some(nativeResponse.code)
       evidence.rawResponse = %nativeResponse.body
       for (header, field) in [
           ("x-softmax-llm-call-id", "call"),
@@ -778,12 +685,22 @@ proc decideAll*(
       var text = ""
       try:
         if nativeResponse.code >= 200 and nativeResponse.code < 300 and responses[position].error.len == 0:
-          let payload = parseJson(nativeResponse.body)
+          var payload: JsonNode
+          try:
+            payload = parseJson(nativeResponse.body)
+          except CatchableError as parseErr:
+            raise newException(LlmInfraError,
+              "llm provider returned invalid JSON: " & parseErr.msg)
           evidence.rawResponse = payload
-          evidence.model = some(payload["model"].getStr())
-          evidence.stopReason = some(payload["stop_reason"].getStr())
-          evidence.inputTokens = some(payload["usage"]["input_tokens"].getInt())
-          evidence.outputTokens = some(payload["usage"]["output_tokens"].getInt())
+          if payload.hasKey("model") and payload["model"].kind == JString:
+            evidence.model = some(payload["model"].getStr())
+          if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
+            evidence.stopReason = some(payload["stop_reason"].getStr())
+          if payload.hasKey("usage") and payload["usage"].kind == JObject:
+            if payload["usage"].hasKey("input_tokens") and payload["usage"]["input_tokens"].kind == JInt:
+              evidence.inputTokens = some(payload["usage"]["input_tokens"].getInt())
+            if payload["usage"].hasKey("output_tokens") and payload["usage"]["output_tokens"].kind == JInt:
+              evidence.outputTokens = some(payload["usage"]["output_tokens"].getInt())
           if payload.hasKey("sampling_evidence") and payload["sampling_evidence"].kind != JNull:
             let sampled = payload["sampling_evidence"]
             var promptTokens, completionTokens: seq[int]
@@ -816,6 +733,18 @@ proc decideAll*(
         result[index].nativeAttempts.add(evidence)
         decision.nativeAttempts = result[index].nativeAttempts
         result[index] = decision
+      except LlmInfraError as error:
+        evidence.response = %text
+        evidence.rejectionReason = some(error.msg)
+        result[index].nativeAttempts.add(evidence)
+        echo "hanabi llm: seat ", seat, " attempt ", attempt, " infrastructure failure"
+        let attempts = result[index].nativeAttempts
+        result[index] = Decision(
+          origin: "missing",
+          failureKind: fkInfra,
+          reject: cleanText(error.msg, MaxRejectLen),
+          nativeAttempts: attempts
+        )
       except CatchableError as error:
         evidence.response = %text
         evidence.rejectionReason = some(error.msg)
@@ -826,9 +755,11 @@ proc decideAll*(
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "hanabi llm: seat ", seat, " falling back to the conventions baseline"
+    echo "hanabi llm: seat ", seat, " rejected after retry; failing episode unscored"
     let attempts = result[index].nativeAttempts
-    result[index] = scriptedAction(sim, seat, skConventions)
-    result[index].nativeAttempts = attempts
-    result[index].origin = "fallback"
-    result[index].reject = cleanText(rejects[index], MaxRejectLen)
+    result[index] = Decision(
+      origin: "rejected",
+      failureKind: fkModel,
+      reject: cleanText(rejects[index], MaxRejectLen),
+      nativeAttempts: attempts
+    )

@@ -21,8 +21,9 @@ For private hosted evidence, supply `COGAME_SAVE_TRAJECTORY_URI`,
 `COWORLD_EPISODE_ID`, `COWORLD_GAME_VERSION`, and `COWORLD_SOURCE_REVISION`.
 The game records native attempts, retries, call identities, executed actions,
 prompt selection, and hashes of the actual rendered messages.
-Missing credentials or invalid replies produce fallbacks, excluded from model
-learning targets. Unknown external actions are not teacher labels.
+Missing credentials, provider errors, or invalid replies fail the episode
+unscored with `action_status: missing` or `action_status: rejected`, excluded
+from model learning targets. Unknown external actions are not teacher labels.
 
 After syncing `nimby.lock`, commit the qualified source and run:
 

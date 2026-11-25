@@ -176,9 +176,11 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
         outcomes[$seat] = %*{"score": results["scores"][seat]}
       let privateOutcome = copy(results)
       privateOutcome["prompt_selection"] = state.selection.selectionMetadata()
-      state.trajectory.get().finish(
-        if results["reason"].getStr() == "complete": esCompleted else: esTruncated,
-        privateOutcome, outcomes)
+      let episodeStatus =
+        case results["reason"].getStr()
+        of "complete": esCompleted
+        else: esTruncated
+      state.trajectory.get().finish(episodeStatus, privateOutcome, outcomes)
       state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
@@ -222,6 +224,70 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     ShutdownGraceSeconds, "s before shutting down"
   sleep(ShutdownGraceSeconds * 1000)
   quit(0)
+
+proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, decision: Decision,
+    before: Sim, operatorPrompt: string) =
+  ## Terminate an unfinished episode unscored with failure diagnostics only.
+  ## Never writes authoritative gameplay scores or results.json.
+  var failurePayload: JsonNode
+  var failureCategory = ""
+  var reason = ""
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let isInfra = decision.failureKind == fkInfra or decision.origin == "missing"
+    failureCategory = if isInfra: "infrastructure_error" else: "rejected_action"
+    let actionStatus = if isInfra: "missing" else: "rejected"
+    reason = if decision.reject.len > 0: decision.reject else: actionStatus
+    let policyName =
+      if seat >= 0 and seat < state.config.players.len:
+        state.config.players[seat].name
+      else:
+        ""
+    failurePayload = %*{
+      "error": true,
+      "status": "failed",
+      "failure_category": failureCategory,
+      "action_status": actionStatus,
+      "seat": seat,
+      "policy": policyName,
+      "turn": before.turn,
+      "reason": reason
+    }
+    if state.trajectory.isSome:
+      state.trajectory.get().recordRejectedDecision(before, seat, decision,
+        operatorPrompt, state.selection)
+      var privateOutcome = copy(failurePayload)
+      privateOutcome["prompt_selection"] = state.selection.selectionMetadata()
+      state.trajectory.get().finish(esFailed, privateOutcome, newJObject())
+      state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+    var errorFrame = %*{
+      "type": "error",
+      "done": true,
+      "status": "failed",
+      "failure_category": failureCategory,
+      "action_status": actionStatus,
+      "seat": seat,
+      "turn": before.turn,
+      "reason": reason
+    }
+    for slot, socket in state.playerSockets:
+      errorFrame["slot"] = %slot
+      socket.send($errorFrame)
+    for socket in state.globalSockets:
+      socket.send($errorFrame)
+
+  sleep(200)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI")
+  if failureUri.len > 0:
+    writeArtifact(
+      failureUri, $failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
+  echo "hanabi: episode failed unscored (", failureCategory, ", seat ", seat,
+    ", turn ", before.turn, "): ", reason
+  quit(1)
 
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
@@ -299,22 +365,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           ## stand.
           echo "hanabi: episode deadline reached after ", state.sim.turn,
             "/", config.maxTurns, " turns; ending early"
-          if state.sim.turn == 0:
-            ## The connect wait ate the budget. Play the whole episode on
-            ## the scripted baseline (no LLM, milliseconds) so the replay is
-            ## never empty.
-            echo "hanabi: no turn was played; running the conventions " &
-              "baseline for the whole episode"
-            while not state.sim.done:
-              let seat = state.sim.pendingSeats()[0]
-              let before = state.sim
-              var decision = scriptedAction(state.sim, seat, skConventions)
-              decision.origin = "fallback"
-              decision.reject = "Episode play deadline expired before first inference"
-              state.sim.applyMove(seat, decision.move, "", "", "fallback")
-              if state.trajectory.isSome:
-                state.trajectory.get().recordAppliedDecision(before, seat,
-                  decision, decision, state.prompts[seat], state.sim.done, state.selection)
           state.sim.endEarly()
           state.broadcastLocked()
           break
@@ -346,11 +396,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var decisions: seq[Decision]
       if seatExternal:
         let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
+        var disconnected = false
         while epochTime() < actionDeadline:
           var ready = false
           withLock stateLock:
             ready = state.hasPendingAction
-          if ready:
+            if not ready and not state.playerSockets.hasKey(seats[0]):
+              disconnected = true
+          if ready or disconnected:
             break
           sleep(20)
         withLock stateLock:
@@ -358,33 +411,52 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if state.hasPendingAction:
             decisions = @[state.pendingAction]
           else:
-            var fallback = scriptedAction(simCopy, seats[0], skConventions)
-            fallback.origin = "fallback"
-            decisions = @[fallback]
+            decisions = @[Decision(
+              origin: "missing",
+              failureKind: fkInfra,
+              reject: (if disconnected: "external player disconnected"
+                       else: "external player timed out")
+            )]
       else:
         decisions = client.decideAll(simCopy, seats, prompts, scripted, state.selection)
 
+      var failed = false
+      var failedSeat = -1
+      var failedDecision: Decision
       withLock stateLock:
         for index, seat in seats:
           let decision = decisions[index]
-          var applied = decision
+          if decision.failureKind != fkNone or decision.origin in ["rejected", "missing"]:
+            echo "hanabi: turn ", state.sim.turn, " ", state.sim.names[seat],
+              " failed (", decision.reject, ")"
+            failed = true
+            failedSeat = seat
+            failedDecision = decision
+            break
           echo "hanabi: turn ", state.sim.turn, " ", state.sim.names[seat],
             " ", moveText(decision.move), " (", decision.origin, ")"
           try:
             state.sim.applyMove(seat, decision.move, decision.note,
               decision.banner, decision.origin)
+            if state.trajectory.isSome:
+              state.trajectory.get().recordAppliedDecision(simCopy, seat,
+                decision, decision, prompts[seat], state.sim.done, state.selection)
           except HanabiError as error:
-            ## Belt and braces: the decision path already validated against
-            ## legalMoves, so this can only fire if the two disagree.
-            echo "hanabi: move rejected; using the conventions baseline"
-            applied = scriptedAction(state.sim, seat, skConventions)
-            applied.origin = "fallback"
-            applied.reject = error.msg
-            state.sim.applyMove(seat, applied.move, "", "", "fallback")
-          if state.trajectory.isSome:
-            state.trajectory.get().recordAppliedDecision(simCopy, seat,
-              decision, applied, prompts[seat], state.sim.done, state.selection)
-        state.broadcastLocked()
+            echo "hanabi: move rejected (", error.msg, "); failing episode unscored"
+            var rejected = decision
+            rejected.origin = "rejected"
+            rejected.failureKind = fkModel
+            rejected.reject = cleanText(error.msg, MaxRejectLen)
+            failed = true
+            failedSeat = seat
+            failedDecision = rejected
+            break
+        if not failed:
+          state.broadcastLocked()
+      if failed:
+        failEpisode(runtimeConfig, failedSeat, failedDecision, simCopy,
+          prompts[failedSeat])
+        return
 
       ## Pace between turns so spectators can read the table.
       if config.turnDelayMs > 0:
@@ -515,14 +587,29 @@ proc websocketHandler(
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
             if state.external[slot] and state.awaitingSeat == slot and
-                state.awaitingTurn == payload["turn"].getInt():
-              var decision = parseDecision(state.sim, payload["action"])
-              let reason = state.sim.illegalReason(decision.move)
-              if reason.len > 0:
-                raise newException(HanabiError, reason)
-              decision.origin = "external"
-              state.pendingAction = decision
-              state.hasPendingAction = true
+                not state.hasPendingAction:
+              try:
+                if not payload.hasKey("turn") or payload["turn"].kind != JInt or
+                    payload["turn"].getInt() != state.awaitingTurn:
+                  raise newException(HanabiError, "action turn mismatch")
+                if not payload.hasKey("action"):
+                  raise newException(HanabiError, "missing \"action\" payload")
+                var decision = parseDecision(state.sim, payload["action"])
+                let reason = state.sim.illegalReason(decision.move)
+                if reason.len > 0:
+                  raise newException(HanabiError, reason)
+                decision.origin = "external"
+                state.pendingAction = decision
+                state.hasPendingAction = true
+              except CatchableError as error:
+                echo "hanabi: rejected external action for seat ", slot,
+                  ": ", error.msg
+                state.pendingAction = Decision(
+                  origin: "rejected",
+                  failureKind: fkModel,
+                  reject: cleanText(error.msg, MaxRejectLen)
+                )
+                state.hasPendingAction = true
           return
         if payload{"type"}.getStr() == "prompt":
           var prompt = payload{"prompt"}.getStr()
@@ -544,6 +631,15 @@ proc websocketHandler(
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
       except CatchableError as error:
         echo "hanabi: rejected player frame for seat ", slot
+        withLock stateLock:
+          if state.external[slot] and state.awaitingSeat == slot and
+              not state.hasPendingAction:
+            state.pendingAction = Decision(
+              origin: "rejected",
+              failureKind: fkModel,
+              reject: cleanText(error.msg, MaxRejectLen)
+            )
+            state.hasPendingAction = true
     of ErrorEvent:
       discard
     of CloseEvent:

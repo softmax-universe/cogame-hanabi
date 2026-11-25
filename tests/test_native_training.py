@@ -1,4 +1,4 @@
-"""Probe actual native game clients with retries and consumed fallbacks."""
+"""Probe actual native game clients with retries, rejected actions, and infra failures."""
 
 import json
 import os
@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix=GAME + "-native-") as temporary:
     for scenario, hosted_model in [
         (case, model)
         for model in ["", "checkpoint/pinned-fixture"]
-        for case in ["retry", "fallback"]
+        for case in ["retry", "rejected", "infra"]
     ]:
         calls = []
 
@@ -54,14 +54,20 @@ with tempfile.TemporaryDirectory(prefix=GAME + "-native-") as temporary:
                 )
                 if self.captured_calls:
                     assert "previous reply" in request["messages"][0]["content"]
+                call_id = str(uuid.uuid4())
+                if self.case == "infra":
+                    self.captured_calls.append((request, call_id, "upstream unavailable"))
+                    body = b"upstream unavailable"
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("X-Softmax-Llm-Call-Id", call_id)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 raw = "PRIVATE REPLY SENTINEL: invalid JSON"
                 if self.captured_calls and self.case == "retry":
-                    raw = (
-                        '{"move":"play 1"}'
-                        if GAME == "hanabi"
-                        else '{"move":"A","notes":"private memory","say":"public line"}'
-                    )
-                call_id = str(uuid.uuid4())
+                    raw = '{"action":"play","slot":1}'
                 self.captured_calls.append((request, call_id, raw))
                 body = json.dumps(
                     {
@@ -113,8 +119,23 @@ with tempfile.TemporaryDirectory(prefix=GAME + "-native-") as temporary:
                 if line.startswith("{")
             ]
             decision = events[0]
+            if scenario == "infra":
+                assert decision["action_status"] == "missing"
+                assert len(decision["attempts"]) == len(calls) == 1
+                assert decision["selected_attempt_id"] is None
+                assert decision["executed_action"] is None
+                assert decision["fallback_origin"] is None
+                assert decision["attempts"][0]["http_status"] == 503
+                assert events[-1]["status"] == "failed"
+                assert events[-1]["outcome"]["failure_category"] == "infrastructure_error"
+                assert events[-1]["outcome"]["action_status"] == "missing"
+                assert "scores" not in events[-1]["outcome"]
+                assert "score" not in events[-1]["outcome"]
+                assert events[-1]["participant_outcomes"] == {}
+                print(GAME, scenario, "native infra failure unscored evidence passed")
+                continue
             assert decision["action_status"] == (
-                "accepted" if scenario == "retry" else "fallback"
+                "accepted" if scenario == "retry" else "rejected"
             )
             assert len(decision["attempts"]) == len(calls) == 2
             for attempt, (request, call_id, raw) in zip(
@@ -139,10 +160,17 @@ with tempfile.TemporaryDirectory(prefix=GAME + "-native-") as temporary:
                     decision["executed_action"]
                     == decision["attempts"][1]["parsed_action"]
                 )
+                assert events[-1]["status"] == "truncated"
             else:
                 assert decision["selected_attempt_id"] is None
-                assert decision["fallback_origin"].startswith("scripted-")
-            assert events[-1]["status"] == "truncated"
+                assert decision["executed_action"] is None
+                assert decision["fallback_origin"] is None
+                assert events[-1]["status"] == "failed"
+                assert events[-1]["outcome"]["failure_category"] == "rejected_action"
+                assert events[-1]["outcome"]["action_status"] == "rejected"
+                assert "scores" not in events[-1]["outcome"]
+                assert "score" not in events[-1]["outcome"]
+                assert events[-1]["participant_outcomes"] == {}
             print(GAME, scenario, "native payload/private attempt/action joins passed")
         finally:
             server.shutdown()

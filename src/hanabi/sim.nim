@@ -504,7 +504,7 @@ proc sameMove*(a, b: Move): bool =
     a.value == b.value
 
 proc moveText*(move: Move): string =
-  ## The short printed form the reply parser also accepts.
+  ## Short human-readable log form.
   case move.kind
   of akPlay: "play " & $move.slot
   of akDiscard: "discard " & $move.slot
@@ -791,7 +791,7 @@ proc applyMove*(sim: var Sim, seat: int, move: Move, note = "", banner = "",
   sim.banners[seat] = banner
   if origin == "fallback":
     sim.stat[seat].fallbacks += 1
-  event.text = sim.notes[seat]
+  event.text = note
   event.banner = banner
   event.hintTokens = sim.hintTokens
   event.fuses = sim.fuses

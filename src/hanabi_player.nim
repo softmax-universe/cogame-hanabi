@@ -73,6 +73,10 @@ when isMainModule:
           echo "hanabi player: final score ", payload{"score"},
             " (", payload{"endReason"}.getStr(), ")"
           break
+        of "error":
+          echo "hanabi player: episode failed (",
+            payload{"reason"}.getStr(), ")"
+          break
         else:
           discard
       except CatchableError as error:
