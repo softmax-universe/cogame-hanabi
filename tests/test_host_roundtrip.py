@@ -236,18 +236,23 @@ def assert_unscored_failure(
     trajectory_path: Path,
     expected_category: str,
     expected_action_status: str,
+    expected_kind: str,
+    expected_seat: int = 0,
 ):
     assert rc != 0, "failed episode must exit non-zero"
     assert not results_path.exists(), "results.json must not be written on failure"
     assert not replay_path.exists(), "replay.json must not be written on failure"
     assert failure_path.exists(), "player_failure.json must be written on failure"
     failure = json.loads(failure_path.read_text())
-    assert failure["error"] is True
-    assert failure["status"] == "failed"
-    assert failure["failure_category"] == expected_category
-    assert failure["action_status"] == expected_action_status
-    for forbidden in ("scores", "score", "winner", "fireworks"):
-        assert forbidden not in failure, f"forbidden key {forbidden} in {failure}"
+    assert set(failure.keys()) == {"failed_policy_index", "kind", "message"}, (
+        f"unexpected player_failure keys: {sorted(failure.keys())}"
+    )
+    assert isinstance(failure["failed_policy_index"], int)
+    assert not isinstance(failure["failed_policy_index"], bool)
+    assert failure["failed_policy_index"] == expected_seat
+    assert failure["kind"] == expected_kind
+    assert isinstance(failure["message"], str)
+    assert 1 <= len(failure["message"]) <= 2000
 
     assert trajectory_path.exists(), "trajectory.jsonl must record failure evidence"
     records = [json.loads(line) for line in trajectory_path.read_text().splitlines() if line.strip()]
@@ -363,7 +368,7 @@ def main():
             assert len(calls) == 2, f"expected 2 attempts (initial + retry), got {len(calls)}"
             assert_unscored_failure(
                 rc, results_path, replay_path, failure_path, traj_path,
-                "rejected_action", "rejected",
+                "rejected_action", "rejected", "player_error",
             )
             print("roundtrip ambiguous object (unscored rejected_action): PASS")
         finally:
@@ -389,7 +394,7 @@ def main():
             assert len(calls) == 1, f"expected 1 attempt on provider 503, got {len(calls)}"
             assert_unscored_failure(
                 rc, results_path, replay_path, failure_path, traj_path,
-                "infrastructure_error", "missing",
+                "infrastructure_error", "missing", "episode_inconclusive",
             )
             print("roundtrip provider 503 (unscored infrastructure_error): PASS")
         finally:
@@ -412,7 +417,7 @@ def main():
         )
         assert_unscored_failure(
             rc, results_path, replay_path, failure_path, traj_path,
-            "infrastructure_error", "missing",
+            "infrastructure_error", "missing", "episode_inconclusive",
         )
         print("roundtrip missing credentials (unscored infrastructure_error): PASS")
 
