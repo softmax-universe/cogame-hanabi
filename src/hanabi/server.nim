@@ -238,14 +238,16 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, decision: Decision,
     state.finished = true
     let isInfra = decision.failureKind == fkInfra or decision.origin == "missing"
     failureCategory = if isInfra: "infrastructure_error" else: "rejected_action"
+    let failureKind = if isInfra: "episode_inconclusive" else: "player_error"
     let actionStatus = if isInfra: "missing" else: "rejected"
-    reason = if decision.reject.len > 0: decision.reject else: actionStatus
+    let trimmedReason = cleanText(decision.reject, 2000)
+    reason = if trimmedReason.len > 0: trimmedReason else: actionStatus
     let policyName =
       if seat >= 0 and seat < state.config.players.len:
         state.config.players[seat].name
       else:
         ""
-    failurePayload = %*{
+    let failureDiagnostics = %*{
       "error": true,
       "status": "failed",
       "failure_category": failureCategory,
@@ -255,10 +257,15 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, decision: Decision,
       "turn": before.turn,
       "reason": reason
     }
+    failurePayload = %*{
+      "failed_policy_index": seat,
+      "kind": failureKind,
+      "message": reason
+    }
     if state.trajectory.isSome:
       state.trajectory.get().recordRejectedDecision(before, seat, decision,
         operatorPrompt, state.selection)
-      var privateOutcome = copy(failurePayload)
+      var privateOutcome = copy(failureDiagnostics)
       privateOutcome["prompt_selection"] = state.selection.selectionMetadata()
       state.trajectory.get().finish(esFailed, privateOutcome, newJObject())
       state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
@@ -280,7 +287,7 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, decision: Decision,
 
   sleep(200)
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI")
-  if failureUri.len > 0:
+  if failureUri.len > 0 and seat >= 0:
     writeArtifact(
       failureUri, $failurePayload, "application/json",
       "COGAME_PLAYER_FAILURE_METHOD"
