@@ -30,19 +30,19 @@ discard pile, the tokens, the whole public move log and an enumerated list
 of every legal move — to Claude, and Claude answers with one canonical JSON object copied from
 that list (bare or inside a single ordinary outer Markdown code fence, plus
 an optional private `note` and a spectator-only `banner`). One request per
-turn, one retry on a rejected reply, then the episode forfeits (`reason:
-forfeit`, `endReason: forfeit`) rather than silently substituting a scripted
-move. Prompt player containers deliver their prompt over the websocket.
-External players receive the same private observation and legal moves. The
-game checks their selected move and owns the result; invalid, illegal,
-timed-out, or disconnected external actions forfeit the episode.
+turn, one retry on a rejected model reply, then the episode fails unscored
+with failure diagnostics rather than silently substituting a scripted move or
+inventing a forfeit score. Prompt player containers deliver their prompt over
+the websocket. External players receive the same private observation and legal
+moves. The game checks their selected move and owns the result; invalid,
+illegal, timed-out, or disconnected external actions fail the episode unscored.
 
 Two built-in **scripted baselines** — `conventions` (play what you can
 prove, save a partner's last copy off its chop, otherwise give the hint that
 makes the most cards newly playable, otherwise discard your chop) and
 `cautious` (never misplays, never gambles) — play any seat that registers as
-scripted. Non-scripted seats without LLM credentials forfeit rather than
-silently substituting a scripted bot.
+scripted. Non-scripted seats without LLM credentials or with provider errors
+fail the episode unscored rather than silently substituting a scripted bot.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy
 display names never reach any prompt or player frame, so nobody can
@@ -70,8 +70,8 @@ between turns (the score is the stacks as they stand).
   turn resolution, the knowledge/candidate model, the hint annotation,
   endings, the FNV-1a digest and the replay re-derivation; shared by the
   server, the tests and the wasm viewer
-- `src/hanabi/llm.nim` — Claude client (one request per turn, one retry,
-  then the fallback) + the two scripted baselines
+- `src/hanabi/llm.nim` — Claude client (one request per turn, one retry on
+  rejected replies, unscored failure otherwise) + the two scripted baselines
 - `src/hanabi/server.nim` — mummy HTTP/WS server (player, global)
 - `src/hanabi_player.nim` — the prompt-delivery player (`PLAYER_PROMPT` /
   `PLAYER_SCRIPTED` env)
@@ -119,8 +119,9 @@ docker build --platform=linux/amd64 -t coworld-hanabi:ci .
 ./tools/ci/docker_smoke.sh coworld-hanabi:ci
 ```
 
-Export `ANTHROPIC_API_KEY` for real Claude play; omit it and every seat
-plays its scripted baseline.
+Export `ANTHROPIC_API_KEY` (or configure `COWORLD_LLM_ENDPOINT`) for real
+model play; use `PLAYER_SCRIPTED=conventions` or `PLAYER_SCRIPTED=cautious`
+for offline scripted play.
 
 Coworld packaging (from a metta checkout):
 

@@ -15,11 +15,9 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Explicit scripted seats run their deterministic baseline without an LLM.
+## Non-scripted seats without credentials or with failed/rejected inference
+## return a failure decision rather than substituting a scripted move.
 
 import
   std/[json, options, os, strutils, times, unicode],
@@ -32,6 +30,7 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
+  DefaultBedrockModel* = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
   ## The hosted Bedrock sidecar caps 30 requests a minute per episode and a
   ## throttle cascades, so consecutive requests START at least this far
   ## apart. A turn is one request (two with a retry), so this bounds the
@@ -41,6 +40,13 @@ const
   MaxRejectLen* = 200
 
 type
+  LlmInfraError* = object of HanabiError
+
+  FailureKind* = enum
+    fkNone
+    fkModel
+    fkInfra
+
   ScriptKind* = enum
     skNone = "none"
     skConventions = "conventions"
@@ -50,9 +56,10 @@ type
     move*: Move
     note*: string       ## private to the seat, fed back next turn
     banner*: string     ## spectator-only, never read by any seat
-    origin*: string     ## llm | retry | external | scripted | rejected
+    origin*: string     ## llm | retry | external | scripted | rejected | missing
     policy*: string     ## actual scripted teacher identity
-    reject*: string     ## why the model's reply was refused, if it was
+    reject*: string     ## why the model's reply was refused or unavailable
+    failureKind*: FailureKind
     nativeAttempts*: seq[DecisionAttempt]
 
   LlmTransport = enum
@@ -64,11 +71,9 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModel*: string   ## single configured Bedrock model (no fallback rotation)
     bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    model: string         ## active model id
     maxOutputTokens: int
     timeoutSeconds: int
     lastRequestAt: float  ## start of the most recent batch, for the floor
@@ -96,39 +101,16 @@ proc resolveApiKey(): string =
     echo "hanabi llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another. The config "model" field is NOT consulted
-  ## here: it applies to the direct-Anthropic transport only, and the
-  ## haiku-first ordering below is a shared-capacity decision that trumps
-  ## per-game preference.
+proc bedrockModelId*(): string =
+  ## Single Bedrock inference-profile id. BEDROCK_MODEL pins a custom id;
+  ## otherwise use DefaultBedrockModel with no implicit model fallback rotation.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first. `claude-sonnet-4-6` is
-  ## deliberately absent: it times out on every hosted sidecar call and
-  ## turns one throttle into a fallback cascade (cogame-raid, 2026-08-23).
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
+    return pinned
+  DefaultBedrockModel
 
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "hanabi llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+proc bedrockUrl*(client: LlmClient): string =
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -156,11 +138,12 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = bedrockModelId()
+    result.model = result.bedrockModel
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "hanabi llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
+      result.bedrockModel,
       ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
@@ -171,7 +154,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "hanabi llm: no LLM credentials; non-scripted seats will forfeit"
+    echo "hanabi llm: no LLM credentials; non-scripted seats will fail unscored"
 
 # ---- Scripted baselines -----------------------------------------------------
 #
@@ -566,32 +549,34 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
-proc textOf(client: LlmClient, response: Response, error, url: string):
+proc textOf*(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a HanabiError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next turn.
+  ## The text of one batched reply, or an error describing why there is none.
+  ## Transport, auth, throttle, and non-2xx provider errors raise LlmInfraError
+  ## without rotating to an alternate model.
   if error.len > 0:
-    raise newException(HanabiError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = headRunes(response.body, 400)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(HanabiError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(HanabiError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = headRunes(response.body, 300)
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(HanabiError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(HanabiError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "llm provider error " & $response.code &
       ": " & headRunes(response.body, 300))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raise newException(LlmInfraError,
+      "llm provider returned invalid JSON: " & parseErr.msg)
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(HanabiError, "anthropic refusal")
+  if not payload.hasKey("content") or payload["content"].kind != JArray:
+    raise newException(LlmInfraError, "llm provider response missing content")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
@@ -631,8 +616,10 @@ proc decideAll*(
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — for Hanabi that list is
   ## always the single seat whose turn it is, so this is one request and at
-  ## most one retry. Genuine scripted seats run their baseline; non-scripted
-  ## failures return origin="rejected" without substituting a scripted move.
+  ## most one retry on a rejected model reply. Genuine scripted seats run
+  ## their baseline; non-scripted failures return failureKind=fkInfra
+  ## (origin="missing") or failureKind=fkModel (origin="rejected") without
+  ## substituting a scripted move.
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   var rejects = newSeq[string](seats.len)
@@ -642,7 +629,8 @@ proc decideAll*(
       result[index] = scriptedAction(sim, seat, kind)
     elif client.disabled:
       result[index] = Decision(
-        origin: "rejected",
+        origin: "missing",
+        failureKind: fkInfra,
         reject: "Inference credentials unavailable"
       )
     else:
@@ -680,6 +668,8 @@ proc decideAll*(
       var evidence = pendingEvidence[position]
       evidence.latencyMs = some((epochTime() - started) * 1000)
       let nativeResponse = responses[position].response
+      if nativeResponse.code >= 100 and nativeResponse.code <= 599:
+        evidence.httpStatus = some(nativeResponse.code)
       evidence.rawResponse = %nativeResponse.body
       for (header, field) in [
           ("x-softmax-llm-call-id", "call"),
@@ -695,12 +685,22 @@ proc decideAll*(
       var text = ""
       try:
         if nativeResponse.code >= 200 and nativeResponse.code < 300 and responses[position].error.len == 0:
-          let payload = parseJson(nativeResponse.body)
+          var payload: JsonNode
+          try:
+            payload = parseJson(nativeResponse.body)
+          except CatchableError as parseErr:
+            raise newException(LlmInfraError,
+              "llm provider returned invalid JSON: " & parseErr.msg)
           evidence.rawResponse = payload
-          evidence.model = some(payload["model"].getStr())
-          evidence.stopReason = some(payload["stop_reason"].getStr())
-          evidence.inputTokens = some(payload["usage"]["input_tokens"].getInt())
-          evidence.outputTokens = some(payload["usage"]["output_tokens"].getInt())
+          if payload.hasKey("model") and payload["model"].kind == JString:
+            evidence.model = some(payload["model"].getStr())
+          if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
+            evidence.stopReason = some(payload["stop_reason"].getStr())
+          if payload.hasKey("usage") and payload["usage"].kind == JObject:
+            if payload["usage"].hasKey("input_tokens") and payload["usage"]["input_tokens"].kind == JInt:
+              evidence.inputTokens = some(payload["usage"]["input_tokens"].getInt())
+            if payload["usage"].hasKey("output_tokens") and payload["usage"]["output_tokens"].kind == JInt:
+              evidence.outputTokens = some(payload["usage"]["output_tokens"].getInt())
           if payload.hasKey("sampling_evidence") and payload["sampling_evidence"].kind != JNull:
             let sampled = payload["sampling_evidence"]
             var promptTokens, completionTokens: seq[int]
@@ -733,6 +733,18 @@ proc decideAll*(
         result[index].nativeAttempts.add(evidence)
         decision.nativeAttempts = result[index].nativeAttempts
         result[index] = decision
+      except LlmInfraError as error:
+        evidence.response = %text
+        evidence.rejectionReason = some(error.msg)
+        result[index].nativeAttempts.add(evidence)
+        echo "hanabi llm: seat ", seat, " attempt ", attempt, " infrastructure failure"
+        let attempts = result[index].nativeAttempts
+        result[index] = Decision(
+          origin: "missing",
+          failureKind: fkInfra,
+          reject: cleanText(error.msg, MaxRejectLen),
+          nativeAttempts: attempts
+        )
       except CatchableError as error:
         evidence.response = %text
         evidence.rejectionReason = some(error.msg)
@@ -743,10 +755,11 @@ proc decideAll*(
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "hanabi llm: seat ", seat, " rejected after retry; forfeiting"
+    echo "hanabi llm: seat ", seat, " rejected after retry; failing episode unscored"
     let attempts = result[index].nativeAttempts
     result[index] = Decision(
       origin: "rejected",
+      failureKind: fkModel,
       reject: cleanText(rejects[index], MaxRejectLen),
       nativeAttempts: attempts
     )

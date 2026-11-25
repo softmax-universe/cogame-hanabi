@@ -34,9 +34,9 @@ proc playEpisode(config: GameConfig, withText = false): Sim =
     else:
       result.applyMove(seat, decision.move, "", "", "scripted")
 
-const ReasonValues = ["complete", "deadline", "forfeit"]
+const ReasonValues = ["complete", "deadline"]
 const EndReasonValues = ["perfect", "strikeout", "deckout", "turnlimit",
-  "deadline", "forfeit"]
+  "deadline"]
 
 suite "artifacts":
   test "an episode writes results and a replay that parse strictly":
@@ -153,21 +153,6 @@ suite "re-derivation":
     check frames[^1].reason == "deadline"
     check frames[^1].endReason == "deadline"
     check frames[^1].turn == 9
-    check frames.len == sim.events.len + 1
-
-  test "a forfeit stop is honoured by the re-derivation":
-    let config = fixture(7)
-    var sim = initSim(config)
-    for turn in 0 ..< 4:
-      let seat = sim.pendingSeats()[0]
-      sim.applyMove(seat, scriptedAction(sim, seat, skConventions).move,
-        "", "", "scripted")
-    sim.forfeit()
-    let frames = replayMatch(config, sim.events)
-    check frames[^1].done
-    check frames[^1].reason == "forfeit"
-    check frames[^1].endReason == "forfeit"
-    check frames[^1].turn == 4
     check frames.len == sim.events.len + 1
 
 suite "the event record":

@@ -4,7 +4,8 @@
 ## policies. And the reply parser has to be tolerant in exactly the ways the
 ## design note lists, and strict everywhere else.
 
-import std/[monotimes, strutils, times, unicode, unittest]
+import std/[monotimes, os, strutils, times, unicode, unittest]
+import curly
 import hanabi/[llm, sim, prompts]
 
 proc fixture(seed: int, maxTurns = 80): GameConfig =
@@ -75,7 +76,7 @@ suite "scripted baselines":
     check meanConventions > meanCautious
     check meanConventions >= 12.0
 
-  test "decideAll with no credentials runs scripted seats and rejects non-scripted seats":
+  test "decideAll with no credentials runs scripted seats and fails non-scripted seats as infra":
     let config = fixture(3, maxTurns = 40)
     let client = newLlmClient(config)
     client.disabled = true
@@ -91,16 +92,42 @@ suite "scripted baselines":
         @scripted, PromptSelection())
       check decisions.len == 1
       if scripted[seat] == skNone:
-        check decisions[0].origin == "rejected"
+        check decisions[0].origin == "missing"
+        check decisions[0].failureKind == fkInfra
         check decisions[0].reject.len > 0
         ## Advance with a legal move only to check the next seat in this loop.
         sim.applyMove(seat, scriptedAction(sim, seat, skConventions).move, "", "", "scripted")
       else:
         check sameMove(decisions[0].move, scriptedAction(sim, seat, scripted[seat]).move)
         check decisions[0].origin == "scripted"
+        check decisions[0].failureKind == fkNone
         sim.applyMove(seat, decisions[0].move, "", "", decisions[0].origin)
       turns += 1
     check turns == 12
+
+  test "bedrock client uses a single model with no fallback rotation on 403 or 429":
+    let prevEndpoint = getEnv("COWORLD_LLM_ENDPOINT")
+    let prevBedrockUrl = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
+    let prevBedrockModel = getEnv("BEDROCK_MODEL")
+    defer:
+      putEnv("COWORLD_LLM_ENDPOINT", prevEndpoint)
+      putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", prevBedrockUrl)
+      putEnv("BEDROCK_MODEL", prevBedrockModel)
+    putEnv("COWORLD_LLM_ENDPOINT", "")
+    putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9")
+    putEnv("BEDROCK_MODEL", "")
+    let client = newLlmClient(fixture(1))
+    check client.bedrockModel == DefaultBedrockModel
+    let beforeUrl = client.bedrockUrl()
+    expect LlmInfraError:
+      discard client.textOf(Response(code: 429, body: "throttled"), "", beforeUrl)
+    check client.bedrockModel == DefaultBedrockModel
+    check client.bedrockUrl() == beforeUrl
+    expect LlmInfraError:
+      discard client.textOf(Response(code: 403, body: "Model access is denied"), "", beforeUrl)
+    check client.bedrockModel == DefaultBedrockModel
+    check client.bedrockUrl() == beforeUrl
+    check client.disabled
 
 suite "reply parsing":
   proc parsed(sim: Sim, text: string): Decision =

@@ -87,8 +87,8 @@ type
     lastMove*: GameEvent           ## the move this state was produced by
     phase*: Phase
     done*: bool
-    reason*: string                ## "complete" | "deadline" | "forfeit"
-    endReason*: string             ## perfect|strikeout|deckout|turnlimit|deadline|forfeit
+    reason*: string                ## "complete" | "deadline"
+    endReason*: string             ## perfect|strikeout|deckout|turnlimit|deadline
     events*: seq[GameEvent]
 
 # ---- Small helpers ----------------------------------------------------------
@@ -791,7 +791,7 @@ proc applyMove*(sim: var Sim, seat: int, move: Move, note = "", banner = "",
   sim.banners[seat] = banner
   if origin == "fallback":
     sim.stat[seat].fallbacks += 1
-  event.text = sim.notes[seat]
+  event.text = note
   event.banner = banner
   event.hintTokens = sim.hintTokens
   event.fuses = sim.fuses
@@ -822,13 +822,6 @@ proc endEarly*(sim: var Sim) =
   if sim.done:
     return
   sim.settle("deadline", "deadline")
-
-proc forfeit*(sim: var Sim) =
-  ## End the episode immediately when the acting seat fails to supply a valid
-  ## legal move, instead of silently substituting a scripted move.
-  if sim.done:
-    return
-  sim.settle("forfeit", "forfeit")
 
 # ---- Results ----------------------------------------------------------------
 

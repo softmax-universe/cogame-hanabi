@@ -21,7 +21,20 @@ config.sampled = true
 for name in replay["policyNames"]: config.players.add(PlayerConfig(name: name.getStr()))
 doAssert summary["seed_family"].getStr() == "hanabi-" & $config.seed
 var events: seq[GameEvent]
-for event in replay["events"]: events.add(eventFromJson(event))
+var moveIdx = 0
+for eventNode in replay["events"]:
+  var event = eventFromJson(eventNode)
+  if event.kind == evMove:
+    ## Public replay omits private notes; restore the turn's private note from
+    ## the private decision capture before seeded re-derivation.
+    doAssert event.text.len == 0
+    doAssert moveIdx < captures.len - 1
+    let capturedAction = captures[moveIdx]["executed_action"]
+    if capturedAction.kind == JObject and capturedAction.hasKey("note") and
+        capturedAction["note"].kind == JString:
+      event.text = capturedAction["note"].getStr()
+    inc moveIdx
+  events.add(event)
 let frames = replayMatch(config, events)
 let fullSchedule = frames[^1].done and frames[^1].reason == "complete"
 doAssert frames[^1].resultsJson()["scores"] == replay["results"]["scores"]
@@ -79,14 +92,6 @@ for eventIndex, event in events:
     doAssert capture["observation"]["prompt_attempts"] == expectedMetadata
     doAssert selectedFound == (capture["action_status"].getStr() == "accepted")
     inc index
-if frames[^1].reason == "forfeit" and index < captures.len - 1:
-  let capture = captures[index]
-  doAssert capture["event_type"].getStr() == "decision"
-  doAssert capture["action_status"].getStr() == "rejected"
-  doAssert capture["selected_attempt_id"].kind == JNull
-  doAssert capture["executed_action"].kind == JNull
-  doAssert summary["status"].getStr() == "failed"
-  inc index
 doAssert index == captures.len - 1
 echo $(%*{"seed": config.seed, "scores": replay["results"]["scores"],
   "full_schedule": fullSchedule, "decisions": index, "policy_names": replay["policyNames"]})
