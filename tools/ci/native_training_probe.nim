@@ -24,7 +24,7 @@ if paramStr(2) == "retry":
   doAssert decision.nativeAttempts[1].accepted
   doAssert sameMove(decision.move, Move(kind: akPlay, slot: 1, target: -1))
 else:
-  doAssert decision.origin == "fallback"
+  doAssert decision.origin == "rejected"
   doAssert not decision.nativeAttempts[1].accepted
 for attempt in decision.nativeAttempts:
   doAssert attempt.platformCallId.isSome
@@ -33,8 +33,16 @@ for attempt in decision.nativeAttempts:
   doAssert attempt.latencyMs.isSome
   doAssert attempt.inputTokens.get() == 3
   doAssert attempt.outputTokens.get() == 2
-game.applyMove(0, decision.move, decision.note, decision.banner, decision.origin)
 let trajectory = newDecisionTrajectory("probe", "probe", "hanabi", "fixture", "fixture-source")
-trajectory.recordAppliedDecision(before, 0, decision, decision, operatorPrompts[0], game.done, PromptSelection(variant: pvMixed, seed: 4))
-trajectory.finish(esTruncated, game.resultsJson(), %*{})
+if paramStr(2) == "retry":
+  game.applyMove(0, decision.move, decision.note, decision.banner, decision.origin)
+  trajectory.recordAppliedDecision(before, 0, decision, decision, operatorPrompts[0], game.done, PromptSelection(variant: pvMixed, seed: 4))
+  trajectory.finish(esTruncated, game.resultsJson(), %*{})
+else:
+  game.forfeit()
+  doAssert game.turn == 0
+  doAssert game.reason == "forfeit"
+  doAssert game.endReason == "forfeit"
+  trajectory.recordRejectedDecision(before, 0, decision, operatorPrompts[0], PromptSelection(variant: pvMixed, seed: 4))
+  trajectory.finish(esFailed, game.resultsJson(), %*{})
 echo trajectory.eventsJsonl()

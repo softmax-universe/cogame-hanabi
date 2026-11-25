@@ -176,9 +176,12 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
         outcomes[$seat] = %*{"score": results["scores"][seat]}
       let privateOutcome = copy(results)
       privateOutcome["prompt_selection"] = state.selection.selectionMetadata()
-      state.trajectory.get().finish(
-        if results["reason"].getStr() == "complete": esCompleted else: esTruncated,
-        privateOutcome, outcomes)
+      let episodeStatus =
+        case results["reason"].getStr()
+        of "complete": esCompleted
+        of "forfeit": esFailed
+        else: esTruncated
+      state.trajectory.get().finish(episodeStatus, privateOutcome, outcomes)
       state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
@@ -299,22 +302,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           ## stand.
           echo "hanabi: episode deadline reached after ", state.sim.turn,
             "/", config.maxTurns, " turns; ending early"
-          if state.sim.turn == 0:
-            ## The connect wait ate the budget. Play the whole episode on
-            ## the scripted baseline (no LLM, milliseconds) so the replay is
-            ## never empty.
-            echo "hanabi: no turn was played; running the conventions " &
-              "baseline for the whole episode"
-            while not state.sim.done:
-              let seat = state.sim.pendingSeats()[0]
-              let before = state.sim
-              var decision = scriptedAction(state.sim, seat, skConventions)
-              decision.origin = "fallback"
-              decision.reject = "Episode play deadline expired before first inference"
-              state.sim.applyMove(seat, decision.move, "", "", "fallback")
-              if state.trajectory.isSome:
-                state.trajectory.get().recordAppliedDecision(before, seat,
-                  decision, decision, state.prompts[seat], state.sim.done, state.selection)
           state.sim.endEarly()
           state.broadcastLocked()
           break
@@ -346,11 +333,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var decisions: seq[Decision]
       if seatExternal:
         let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
+        var disconnected = false
         while epochTime() < actionDeadline:
           var ready = false
           withLock stateLock:
             ready = state.hasPendingAction
-          if ready:
+            if not ready and not state.playerSockets.hasKey(seats[0]):
+              disconnected = true
+          if ready or disconnected:
             break
           sleep(20)
         withLock stateLock:
@@ -358,33 +348,49 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if state.hasPendingAction:
             decisions = @[state.pendingAction]
           else:
-            var fallback = scriptedAction(simCopy, seats[0], skConventions)
-            fallback.origin = "fallback"
-            decisions = @[fallback]
+            decisions = @[Decision(
+              origin: "rejected",
+              reject: (if disconnected: "external player disconnected"
+                       else: "external player timed out")
+            )]
       else:
         decisions = client.decideAll(simCopy, seats, prompts, scripted, state.selection)
 
+      var forfeited = false
       withLock stateLock:
         for index, seat in seats:
           let decision = decisions[index]
-          var applied = decision
+          if decision.origin == "rejected":
+            echo "hanabi: turn ", state.sim.turn, " ", state.sim.names[seat],
+              " forfeited (", decision.reject, ")"
+            state.sim.forfeit()
+            if state.trajectory.isSome:
+              state.trajectory.get().recordRejectedDecision(simCopy, seat,
+                decision, prompts[seat], state.selection)
+            forfeited = true
+            break
           echo "hanabi: turn ", state.sim.turn, " ", state.sim.names[seat],
             " ", moveText(decision.move), " (", decision.origin, ")"
           try:
             state.sim.applyMove(seat, decision.move, decision.note,
               decision.banner, decision.origin)
+            if state.trajectory.isSome:
+              state.trajectory.get().recordAppliedDecision(simCopy, seat,
+                decision, decision, prompts[seat], state.sim.done, state.selection)
           except HanabiError as error:
-            ## Belt and braces: the decision path already validated against
-            ## legalMoves, so this can only fire if the two disagree.
-            echo "hanabi: move rejected; using the conventions baseline"
-            applied = scriptedAction(state.sim, seat, skConventions)
-            applied.origin = "fallback"
-            applied.reject = error.msg
-            state.sim.applyMove(seat, applied.move, "", "", "fallback")
-          if state.trajectory.isSome:
-            state.trajectory.get().recordAppliedDecision(simCopy, seat,
-              decision, applied, prompts[seat], state.sim.done, state.selection)
+            echo "hanabi: move rejected (", error.msg, "); forfeiting"
+            var rejected = decision
+            rejected.origin = "rejected"
+            rejected.reject = cleanText(error.msg, MaxRejectLen)
+            state.sim.forfeit()
+            if state.trajectory.isSome:
+              state.trajectory.get().recordRejectedDecision(simCopy, seat,
+                rejected, prompts[seat], state.selection)
+            forfeited = true
+            break
         state.broadcastLocked()
+      if forfeited:
+        break
 
       ## Pace between turns so spectators can read the table.
       if config.turnDelayMs > 0:
@@ -515,14 +521,28 @@ proc websocketHandler(
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
             if state.external[slot] and state.awaitingSeat == slot and
-                state.awaitingTurn == payload["turn"].getInt():
-              var decision = parseDecision(state.sim, payload["action"])
-              let reason = state.sim.illegalReason(decision.move)
-              if reason.len > 0:
-                raise newException(HanabiError, reason)
-              decision.origin = "external"
-              state.pendingAction = decision
-              state.hasPendingAction = true
+                not state.hasPendingAction:
+              try:
+                if not payload.hasKey("turn") or payload["turn"].kind != JInt or
+                    payload["turn"].getInt() != state.awaitingTurn:
+                  raise newException(HanabiError, "action turn mismatch")
+                if not payload.hasKey("action"):
+                  raise newException(HanabiError, "missing \"action\" payload")
+                var decision = parseDecision(state.sim, payload["action"])
+                let reason = state.sim.illegalReason(decision.move)
+                if reason.len > 0:
+                  raise newException(HanabiError, reason)
+                decision.origin = "external"
+                state.pendingAction = decision
+                state.hasPendingAction = true
+              except CatchableError as error:
+                echo "hanabi: rejected external action for seat ", slot,
+                  ": ", error.msg
+                state.pendingAction = Decision(
+                  origin: "rejected",
+                  reject: cleanText(error.msg, MaxRejectLen)
+                )
+                state.hasPendingAction = true
           return
         if payload{"type"}.getStr() == "prompt":
           var prompt = payload{"prompt"}.getStr()
@@ -544,6 +564,14 @@ proc websocketHandler(
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
       except CatchableError as error:
         echo "hanabi: rejected player frame for seat ", slot
+        withLock stateLock:
+          if state.external[slot] and state.awaitingSeat == slot and
+              not state.hasPendingAction:
+            state.pendingAction = Decision(
+              origin: "rejected",
+              reject: cleanText(error.msg, MaxRejectLen)
+            )
+            state.hasPendingAction = true
     of ErrorEvent:
       discard
     of CloseEvent:

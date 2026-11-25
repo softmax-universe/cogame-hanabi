@@ -27,20 +27,22 @@ policy prompt plus its observation — the three partners' hands face-up, its
 **own hand as knowledge only** (positive hints, negative information, the
 candidate set, `knownPlayable`/`knownDead`, the chop), the fireworks, the
 discard pile, the tokens, the whole public move log and an enumerated list
-of every legal move — to Claude, and Claude answers with one JSON object
-copied from that list (plus an optional private `note` and a
-spectator-only `banner`). One request per turn, one retry on a rejected
-reply, then the scripted fallback. Prompt player containers deliver their
-prompt over the websocket.
+of every legal move — to Claude, and Claude answers with one canonical JSON object copied from
+that list (bare or inside a single ordinary outer Markdown code fence, plus
+an optional private `note` and a spectator-only `banner`). One request per
+turn, one retry on a rejected reply, then the episode forfeits (`reason:
+forfeit`, `endReason: forfeit`) rather than silently substituting a scripted
+move. Prompt player containers deliver their prompt over the websocket.
 External players receive the same private observation and legal moves. The
-game checks their selected move and owns the result.
+game checks their selected move and owns the result; invalid, illegal,
+timed-out, or disconnected external actions forfeit the episode.
 
 Two built-in **scripted baselines** — `conventions` (play what you can
 prove, save a partner's last copy off its chop, otherwise give the hint that
 makes the most cards newly playable, otherwise discard your chop) and
 `cautious` (never misplays, never gambles) — play any seat that registers as
-scripted, and every seat when no LLM credentials are available, so episodes
-and offline certification always complete.
+scripted. Non-scripted seats without LLM credentials forfeit rather than
+silently substituting a scripted bot.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy
 display names never reach any prompt or player frame, so nobody can

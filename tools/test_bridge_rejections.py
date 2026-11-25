@@ -26,12 +26,27 @@ try:
     decisions = 0
     while observation['kind'] == 'decision':
         teacher = request({'kind': 'teacher'})['response']
-        for invalid in ['not JSON', '{}', '[]', '{"experiment":"INVALID","move":"invalid"}']:
+        for invalid in [
+            'not JSON',
+            '{}',
+            '[]',
+            '{"experiment":"INVALID","move":"invalid"}',
+            '{"move":"play 1"}',
+            f'{teacher} trailing prose',
+            f'leading prose {teacher}',
+            f'{teacher} {teacher}',
+            f'```json\n{teacher}\n```\nextra prose',
+        ]:
             rejected = request({'kind': 'step', 'decision_id': observation['decision_id'], 'response': invalid})
             assert rejected['kind'] == 'rejected' and rejected['reason']
             assert rejected['observation'] == observation
             assert request({'kind': 'teacher'})['response'] == teacher
-        formatted = f'```json\n{teacher}\n```' if decisions % 2 == 0 else teacher
+        if decisions % 3 == 0:
+            formatted = f'```json\n{teacher}\n```'
+        elif decisions % 3 == 1:
+            formatted = f'```\n{teacher}\n```'
+        else:
+            formatted = teacher
         result = request({'kind': 'step', 'decision_id': observation['decision_id'], 'response': formatted})
         assert result['kind'] == 'accepted'
         observation = result['observation']

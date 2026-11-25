@@ -87,8 +87,8 @@ type
     lastMove*: GameEvent           ## the move this state was produced by
     phase*: Phase
     done*: bool
-    reason*: string                ## "complete" | "deadline"
-    endReason*: string             ## perfect|strikeout|deckout|turnlimit|deadline
+    reason*: string                ## "complete" | "deadline" | "forfeit"
+    endReason*: string             ## perfect|strikeout|deckout|turnlimit|deadline|forfeit
     events*: seq[GameEvent]
 
 # ---- Small helpers ----------------------------------------------------------
@@ -504,7 +504,7 @@ proc sameMove*(a, b: Move): bool =
     a.value == b.value
 
 proc moveText*(move: Move): string =
-  ## The short printed form the reply parser also accepts.
+  ## Short human-readable log form.
   case move.kind
   of akPlay: "play " & $move.slot
   of akDiscard: "discard " & $move.slot
@@ -822,6 +822,13 @@ proc endEarly*(sim: var Sim) =
   if sim.done:
     return
   sim.settle("deadline", "deadline")
+
+proc forfeit*(sim: var Sim) =
+  ## End the episode immediately when the acting seat fails to supply a valid
+  ## legal move, instead of silently substituting a scripted move.
+  if sim.done:
+    return
+  sim.settle("forfeit", "forfeit")
 
 # ---- Results ----------------------------------------------------------------
 

@@ -79,6 +79,14 @@ for eventIndex, event in events:
     doAssert capture["observation"]["prompt_attempts"] == expectedMetadata
     doAssert selectedFound == (capture["action_status"].getStr() == "accepted")
     inc index
+if frames[^1].reason == "forfeit" and index < captures.len - 1:
+  let capture = captures[index]
+  doAssert capture["event_type"].getStr() == "decision"
+  doAssert capture["action_status"].getStr() == "rejected"
+  doAssert capture["selected_attempt_id"].kind == JNull
+  doAssert capture["executed_action"].kind == JNull
+  doAssert summary["status"].getStr() == "failed"
+  inc index
 doAssert index == captures.len - 1
 echo $(%*{"seed": config.seed, "scores": replay["results"]["scores"],
   "full_schedule": fullSchedule, "decisions": index, "policy_names": replay["policyNames"]})

@@ -75,7 +75,7 @@ suite "scripted baselines":
     check meanConventions > meanCautious
     check meanConventions >= 12.0
 
-  test "decideAll with no credentials is exactly the scripted decision":
+  test "decideAll with no credentials runs scripted seats and rejects non-scripted seats":
     let config = fixture(3, maxTurns = 40)
     let client = newLlmClient(config)
     client.disabled = true
@@ -86,14 +86,19 @@ suite "scripted baselines":
       let seats = sim.pendingSeats()
       check seats.len == 1
       let seat = seats[0]
-      let scripted = [skNone, skCautious, skNone, skCautious]
+      let scripted = [skNone, skCautious, skNone, skConventions]
       let decisions = client.decideAll(sim, seats, @["be bold", "", "", ""],
         @scripted, PromptSelection())
       check decisions.len == 1
-      let kind = if scripted[seat] == skNone: skConventions else: scripted[seat]
-      check sameMove(decisions[0].move, scriptedAction(sim, seat, kind).move)
-      check decisions[0].origin == (if scripted[seat] == skNone: "fallback" else: "scripted")
-      sim.applyMove(seat, decisions[0].move, "", "", decisions[0].origin)
+      if scripted[seat] == skNone:
+        check decisions[0].origin == "rejected"
+        check decisions[0].reject.len > 0
+        ## Advance with a legal move only to check the next seat in this loop.
+        sim.applyMove(seat, scriptedAction(sim, seat, skConventions).move, "", "", "scripted")
+      else:
+        check sameMove(decisions[0].move, scriptedAction(sim, seat, scripted[seat]).move)
+        check decisions[0].origin == "scripted"
+        sim.applyMove(seat, decisions[0].move, "", "", decisions[0].origin)
       turns += 1
     check turns == 12
 
@@ -101,40 +106,34 @@ suite "reply parsing":
   proc parsed(sim: Sim, text: string): Decision =
     parseDecision(sim, extractJsonObject(text))
 
-  test "the tolerated shapes all normalise to the same move":
+  test "canonical JSON moves parse bare or inside a single outer markdown code fence":
     var sim = initSim(fixture(5))
     sim.hands[1].cards[0].card = Card(colour: 0, rank: 3)   ## a red 3
     sim.hands[1].cards[1].card = Card(colour: 2, rank: 1)
     sim.hands[1].cards[2].card = Card(colour: 3, rank: 4)
     sim.hands[1].cards[3].card = Card(colour: 4, rank: 2)
-    let want = Move(kind: akHint, target: 1, hintKind: hkColour, value: 0)
+    let wantColour = Move(kind: akHint, target: 1, hintKind: hkColour, value: 0)
     check sameMove(sim.parsed(
       """{"action":"hint","target":1,"hintType":"colour","hintValue":"red"}"""
-      ).move, want)
-    check sameMove(sim.parsed(
-      """{"action":"hint","target":1,"hintType":"color","hintValue":"r"}"""
-      ).move, want)
-    check sameMove(sim.parsed("""{"move":"hint 1 red"}""").move, want)
-    check sameMove(sim.parsed(
-      """{"action":"hint","target":"""" & sim.names[1] &
-      """","hint":"red"}""").move, want)
-    ## A markdown fence, and a valid object followed by prose.
+      ).move, wantColour)
+    ## Single outer markdown code fence: json-tagged or plain.
     check sameMove(sim.parsed("```json\n{\"action\":\"play\",\"slot\":2}\n```")
       .move, Move(kind: akPlay, slot: 2, target: -1))
-    check sameMove(sim.parsed(
-      """{"action": "play", "slot": "2"} — I think that is the red 1."""
-      ).move, Move(kind: akPlay, slot: 2, target: -1))
-    check sameMove(sim.parsed("""{"move":"play 3"}""").move,
-      Move(kind: akPlay, slot: 3, target: -1))
-    ## number/rank spellings and a numeric rank value.
+    check sameMove(sim.parsed("```\n{\"action\":\"play\",\"slot\":3}\n```")
+      .move, Move(kind: akPlay, slot: 3, target: -1))
+    check sameMove(sim.parsed("```JSON\r\n{\"action\":\"discard\",\"slot\":4}\r\n```")
+      .move, Move(kind: akDiscard, slot: 4, target: -1))
+    ## Rank hint with canonical string hintValue.
     let rank = Move(kind: akHint, target: 1, hintKind: hkRank, value: 3)
     check sameMove(sim.parsed(
-      """{"action":"hint","target":1,"hintType":"number","hintValue":3}"""
+      """{"action":"hint","target":1,"hintType":"rank","hintValue":"3"}"""
       ).move, rank)
-    check sameMove(sim.parsed("""{"move":"hint 1 3"}""").move, rank)
-    ## Discards need a token back first, but they parse either way.
-    check sameMove(sim.parsed("""{"action":"discard","slot":4}""").move,
-      Move(kind: akDiscard, slot: 4, target: -1))
+    ## Optional note and banner fields still work.
+    let withExtras = sim.parsed(
+      """{"action":"play","slot":1,"note":"keep","banner":"go"}""")
+    check sameMove(withExtras.move, Move(kind: akPlay, slot: 1, target: -1))
+    check withExtras.note == "keep"
+    check withExtras.banner == "go"
 
   test "notes and banners are capped on rune boundaries":
     var sim = initSim(fixture(5))
@@ -154,23 +153,53 @@ suite "reply parsing":
       """{"action":"play","slot":1,"banner":"one\ntwo"}""")
     check multi.banner == "one two"
 
-  test "everything else is rejected with a reason":
+  test "legacy shims, aliases, prose, extra objects, and bad fields are rejected":
     var sim = initSim(fixture(5))
-    expect HanabiError:
-      discard sim.parsed("""{"action":"ponder","slot":1}""")
-    expect HanabiError:
-      discard sim.parsed("""{"note":"no action here"}""")
-    expect HanabiError:
-      discard sim.parsed("I would play slot 1, I think.")
-    expect HanabiError:
-      discard sim.parsed("""{"action":"hint","target":0,"hint":"puce"}""")
+    let rejectedReplies = [
+      """{"action":"ponder","slot":1}""",
+      """{"note":"no action here"}""",
+      "I would play slot 1, I think.",
+      """{"move":"play 2"}""",
+      """{"move":"hint 1 red"}""",
+      """{"action":"tell","target":1,"hintType":"colour","hintValue":"red"}""",
+      """{"action":"clue","target":1,"hintType":"colour","hintValue":"red"}""",
+      """{"action":"hint","target":1,"hintType":"color","hintValue":"red"}""",
+      """{"action":"hint","target":1,"hintType":"suit","hintValue":"red"}""",
+      """{"action":"hint","target":1,"hintType":"number","hintValue":"3"}""",
+      """{"action":"hint","target":1,"hintType":"value","hintValue":"3"}""",
+      """{"action":"hint","target":1,"hintType":"colour","hintValue":"r"}""",
+      """{"action":"hint","target":1,"hint":"red"}""",
+      """{"action":"hint","target":1,"hintValue":"red"}""",
+      """{"action":"hint","target":1,"hintType":"rank","hintValue":3}""",
+      """{"action":"hint","target":"""" & sim.names[1] & """","hintType":"colour","hintValue":"red"}""",
+      """{"action":"hint","target":"1","hintType":"colour","hintValue":"red"}""",
+      """{"action":"play","slot":"2"}""",
+      """{"action":"play","slot":2.0}""",
+      """{"action":"play","slot":1,"extra":true}""",
+      """{"action":"play","slot":1,"target":2}""",
+      """{"action":"play","slot":1,"note":123}""",
+      """{"action":"play","slot":1,"banner":[]}""",
+      """{"action": "play", "slot": 2} — I think that is the red 1.""",
+      """Sure: {"action":"play","slot":2}""",
+      """{"action":"play","slot":1} {"action":"play","slot":2}""",
+      "```json\n{\"action\":\"play\",\"slot\":1}\n```\nExtra prose.",
+      "Intro\n```json\n{\"action\":\"play\",\"slot\":1}\n```",
+      "```python\n{\"action\":\"play\",\"slot\":1}\n```",
+      "```json\n{\"action\":\"play\",\"slot\":1}",
+      "```json\n{\"action\":\"play\",\"slot\":1}\n```\n```json\n{\"action\":\"play\",\"slot\":2}\n```",
+      """[]""",
+      """"play 1""""
+    ]
+    for reply in rejectedReplies:
+      expect HanabiError:
+        discard sim.parsed(reply)
     ## Parseable but illegal: the legal-move list is what refuses these.
     check sim.illegalReason(sim.parsed(
       """{"action":"play","slot":0}""").move).len > 0
     check sim.illegalReason(sim.parsed(
       """{"action":"play","slot":9}""").move).len > 0
     check sim.illegalReason(sim.parsed(
-      """{"action":"hint","target":0,"hintType":"rank","hintValue":1}"""
+      """{"action":"hint","target":0,"hintType":"rank","hintValue":"1"}"""
       ).move).len > 0                                   ## self-hint
     check sim.hintTokens == MaxHintTokens
     check sim.illegalReason(sim.parsed(
